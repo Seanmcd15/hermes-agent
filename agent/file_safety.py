@@ -69,6 +69,30 @@ def _resolve_target(path: str) -> Optional[Path]:
     return None
 
 
+def _detected_remote_homes() -> set[str]:
+    """Homes of live remote backends (SSH/daytona/…) that have confirmed ``$HOME``.
+
+    File tools expand ``~`` against the backend home, then call the write guards
+    with the absolute remote path. Including that home here extends the existing
+    per-home denylist/prefix lists (``.aws``, ``.gnupg``, …) to the remote side.
+    Shape-based denials below still cover absolute remote credential paths even
+    when no backend is live yet.
+    """
+    homes: set[str] = set()
+    with suppress(Exception):
+        from tools.terminal_tool import _active_environments, _env_lock
+
+        with _env_lock:
+            envs = list(_active_environments.values())
+        for env in envs:
+            if not getattr(env, "_remote_home_detected", False):
+                continue
+            home = getattr(env, "_remote_home", None)
+            if isinstance(home, str) and home and os.path.isabs(home):
+                homes.add(home)
+    return homes
+
+
 def _guard_homes(path: str = "") -> set[str]:
     """Every home the write guards must cover. Process ``~`` alone is wrong whenever the
     process HOME is not the OS user's real home — ``TERMINAL_HOME_MODE=profile``,
@@ -76,8 +100,9 @@ def _guard_homes(path: str = "") -> set[str]:
     the real home's credential paths unguarded against absolute-path writes while file
     tools happily write there (and ``_expand_tilde`` may route ``~`` to yet another
     home). Deny/approval lists are built over the union: process home, real home,
-    subprocess home, and the profile home. A ``~name/...`` input resolves to a named
-    account's home, which joins the set so ``~root/.ssh/authorized_keys`` stays denied."""
+    subprocess home, the profile home, and any detected remote backend home. A
+    ``~name/...`` input resolves to a named account's home, which joins the set so
+    ``~root/.ssh/authorized_keys`` stays denied."""
     homes = {os.path.expanduser("~")}
     with suppress(Exception):
         from hermes_constants import get_real_home, get_subprocess_home, _profile_home_path
@@ -85,6 +110,7 @@ def _guard_homes(path: str = "") -> set[str]:
         for candidate in (get_real_home(), get_subprocess_home(), _profile_home_path()):
             if candidate:
                 homes.add(str(candidate))
+    homes |= _detected_remote_homes()
     raw = str(path)
     if len(raw) > 1 and raw.startswith("~") and raw[1] not in "/\\":
         name = raw[1:].split("/", 1)[0].split("\\", 1)[0]
@@ -236,6 +262,48 @@ def build_write_approval_paths(home: str) -> set[str]:
     return {os.path.realpath(os.path.join(home, ".ssh", "config"))}
 
 
+# Home-independent credential path shapes. Remote backends (SSH, daytona, …)
+# expand ``~`` against a remote home that is not among Hermes-host
+# ``_guard_homes``, so absolute paths like ``/home/deploy/.ssh/authorized_keys``
+# must be denied by shape alone — even when no remote home has been detected yet.
+_CREDENTIAL_PATH_SUFFIXES = (
+    "/.ssh/authorized_keys",
+    "/.ssh/id_rsa",
+    "/.ssh/id_ed25519",
+    "/.netrc",
+    "/.pgpass",
+    "/.npmrc",
+    "/.pypirc",
+    "/.git-credentials",
+)
+
+
+def _posix_style(path: str) -> str:
+    """Normalize separators for shape matching (remote paths are POSIX)."""
+    return str(path).replace("\\", "/")
+
+
+def _is_ssh_config_path_shape(resolved: str) -> bool:
+    """True for ``*/.ssh/config`` under any home — approval-gated, never hard-denied."""
+    return _posix_style(resolved).endswith("/.ssh/config")
+
+
+def _is_credential_path_shape(resolved: str) -> bool:
+    """True when ``resolved`` is a credential store by path shape, any home.
+
+    Matches the exact credential files in ``build_write_denied_paths``'s
+    ``home_files``, plus anything under ``*/.ssh/``. ``*/.ssh/config`` is
+    excluded (approval-gated via :func:`_is_ssh_config_path_shape`).
+    """
+    norm = _posix_style(resolved)
+    if _is_ssh_config_path_shape(norm):
+        return False
+    if any(norm.endswith(suf) for suf in _CREDENTIAL_PATH_SUFFIXES):
+        return True
+    # Deny writes under any ``*/.ssh/`` directory (keys, known_hosts, …).
+    return "/.ssh/" in norm or norm.endswith("/.ssh")
+
+
 # HERMES_HOME / root subpaths that the agent's generic file tools must not
 # rewrite. Session transcripts (state.db, sessions/) are application-owned
 # state whose rewrite can falsify history and break resume/compression;
@@ -278,8 +346,17 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     """Credential / protected-subpath / safe-root verdict for an already-resolved path."""
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
-    if any(resolved in build_write_approval_paths(home) for home in homes):
+    # Shape-based ``*/.ssh/config`` covers remote absolute paths that are not
+    # under any Hermes-host home in ``homes``.
+    if _is_ssh_config_path_shape(resolved) or any(
+        resolved in build_write_approval_paths(home) for home in homes
+    ):
         return None
+
+    # Home-independent shape deny: remote absolute credential paths
+    # (``/home/deploy/.ssh/authorized_keys``) never match host ``_guard_homes``.
+    if _is_credential_path_shape(resolved):
+        return "credential"
 
     if any(
         resolved in build_write_denied_paths(home)
@@ -323,8 +400,14 @@ def get_write_denied_error(path: str, *, verb: str = "Write", entry: bool = Fals
 
 def is_write_approval_required(path: str) -> bool:
     """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
-    prompt, callers without a channel treat it as a block (fail closed)."""
+    prompt, callers without a channel treat it as a block (fail closed).
+
+    Shape-based ``*/.ssh/config`` covers remote absolute paths (SSH backend home
+    differs from the Hermes host home) in addition to the per-home approval set.
+    """
     homes, resolved = _homes_and_resolved(path)
+    if _is_ssh_config_path_shape(resolved):
+        return True
     return any(resolved in build_write_approval_paths(home) for home in homes)
 
 

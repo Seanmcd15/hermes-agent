@@ -93,4 +93,58 @@ class TestProfileHomeProcessHome:
         for benign in (tmp_path / "scratch" / "notes.txt", real_home / "projects" / "notes.md"):
             assert fs.is_write_denied(str(benign)) is False, benign
             assert fs.is_write_approval_required(str(benign)) is False, benign
-        assert fs.is_write_denied("~nosuchuser-hopefully/.ssh/authorized_keys") is False
+        # Unknown ``~user`` is not a guard home, but credential *shape* still
+        # hard-denies (home-independent) — fail closed, not open.
+        assert fs.is_write_denied("~nosuchuser-hopefully/.ssh/authorized_keys") is True
+        assert fs.is_write_denied("~nosuchuser-hopefully/projects/notes.md") is False
+
+
+class TestRemoteAbsoluteCredentialShapes:
+    """SSH (and other remote) backends expand ``~`` against a remote home that is
+    not among Hermes-host ``_guard_homes``. Absolute remote credential paths must
+    still hard-deny by shape; ``*/.ssh/config`` stays approval-gated."""
+
+    REMOTE_HOME = "/home/deploy"
+
+    def test_remote_ssh_keys_and_dotfiles_hard_denied(self):
+        for rel in (
+            ".ssh/authorized_keys",
+            ".ssh/id_rsa",
+            ".ssh/id_ed25519",
+            ".ssh/known_hosts",
+            ".ssh/some_key",
+            ".netrc",
+            ".pgpass",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+        ):
+            path = f"{self.REMOTE_HOME}/{rel}"
+            assert fs.is_write_denied(path) is True, path
+            assert fs.is_write_approval_required(path) is False, path
+            err = fs.get_write_denied_error(path)
+            assert err is not None and "protected system/credential file" in err, path
+
+    def test_remote_ssh_config_approval_gated_not_hard_denied(self):
+        path = f"{self.REMOTE_HOME}/.ssh/config"
+        assert fs.is_write_denied(path) is False
+        assert fs.is_write_approval_required(path) is True
+        assert fs.get_write_denied_error(path) is None
+
+    def test_shape_deny_independent_of_detected_remote_home(self, monkeypatch):
+        """Absolute remote credential paths deny even with no live remote home."""
+        monkeypatch.setattr(fs, "_detected_remote_homes", lambda: set())
+        assert fs.is_write_denied(f"{self.REMOTE_HOME}/.ssh/authorized_keys") is True
+        assert fs.is_write_approval_required(f"{self.REMOTE_HOME}/.ssh/config") is True
+
+    def test_detected_remote_home_extends_prefix_denies(self, monkeypatch):
+        """When SSH has confirmed ``$HOME``, non-shape prefixes (``.aws``) join the guards."""
+        monkeypatch.setattr(fs, "_detected_remote_homes", lambda: {self.REMOTE_HOME})
+        assert fs.is_write_denied(f"{self.REMOTE_HOME}/.aws/credentials") is True
+        assert fs.is_write_denied(f"{self.REMOTE_HOME}/projects/notes.md") is False
+
+    def test_host_home_denials_unchanged(self):
+        assert fs.is_write_denied("~/.ssh/authorized_keys") is True
+        assert fs.is_write_denied(os.path.expanduser("~/.ssh/id_ed25519")) is True
+        assert fs.is_write_approval_required(os.path.expanduser("~/.ssh/config")) is True
+        assert fs.is_write_denied(os.path.expanduser("~/.ssh/config")) is False

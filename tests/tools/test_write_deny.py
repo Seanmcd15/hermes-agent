@@ -93,3 +93,17 @@ class TestWriteAllowed:
         home = get_hermes_home()
         for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
             assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+
+
+class TestRemoteAbsoluteCredentialDeny:
+    """Remote-absolute credential paths must deny even when not under host HOME."""
+
+    def test_remote_authorized_keys_denied(self):
+        assert _is_write_denied("/home/deploy/.ssh/authorized_keys") is True
+
+    def test_remote_ssh_config_not_hard_denied(self):
+        from agent.file_safety import is_write_approval_required
+
+        path = "/home/deploy/.ssh/config"
+        assert _is_write_denied(path) is False
+        assert is_write_approval_required(path) is True

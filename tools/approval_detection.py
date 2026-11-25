@@ -15,9 +15,17 @@ import unicodedata
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
-# home is folded into these forms at detection time by _normalize_command_for_detection(), so no
+# host home is folded into these forms at detection time by _normalize_command_for_detection(), so no
 # import-time path snapshot (stale once HERMES_HOME is set after import) lives in the patterns.
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+#
+# Absolute ``/<any>/.../.ssh/...`` (and shell-rc / credential siblings) are ALSO matched by shape:
+# host-home folding cannot see an SSH/daytona remote home (``TERMINAL_ENV=ssh``, remote ``$HOME``
+# ``/home/deploy`` while the Hermes host is ``/home/ubuntu``), nor another account on a multi-user
+# host. Without the absolute arm, ``echo evil > /home/deploy/.ssh/authorized_keys`` skipped approval
+# entirely — the terminal twin of the file_tools host-only ``_guard_homes`` gap.
+_ABSOLUTE_HOME_DIR = r'/(?:[^/\s"\'`]+/)+'  # ≥1 component; bare ``/.ssh`` stays out
+_HOME_SENSITIVE_PREFIX = rf'(?:(?:~|\$home|\$\{{home\}})/|{_ABSOLUTE_HOME_DIR})'
+_SSH_SENSITIVE_PATH = rf'{_HOME_SENSITIVE_PREFIX}\.ssh(?:/|$)'
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'\.env\b'
 )
@@ -28,8 +36,8 @@ _HERMES_CONFIG_PATH = (
 )
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
-_SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
-_CREDENTIAL_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:netrc|pgpass|npmrc|pypirc)\b'
+_SHELL_RC_FILES = rf'{_HOME_SENSITIVE_PREFIX}\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
+_CREDENTIAL_FILES = rf'{_HOME_SENSITIVE_PREFIX}\.' r'(?:netrc|pgpass|npmrc|pypirc)\b'
 # Global flags before a subcommand, each with an optional value. Every flag has one parse ('-' plus
 # its possessive remainder, so '--x' and '--x=v' never split two ways) and a value cannot itself be a
 # flag, so a long run that never reaches the subcommand fails in linear time instead of holding the

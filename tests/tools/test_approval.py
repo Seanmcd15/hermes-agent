@@ -606,6 +606,53 @@ class TestSensitiveCopyMovePattern:
             assert dangerous is False, cmd
 
 
+class TestAbsoluteForeignHomeCredentialWrites:
+    """Host-home folding cannot see an SSH remote home (or another account).
+
+    Contract: a write whose absolute path is ``/<any>/.../.ssh/...`` (or shell-rc /
+    credential siblings) requires approval even when that home is NOT the Hermes
+    host's ``$HOME``. Without the absolute arm, ``TERMINAL_ENV=ssh`` with remote
+    ``/home/deploy`` left ``echo evil > /home/deploy/.ssh/authorized_keys`` auto-
+    approved — unpaired with the file_tools shape deny for the same paths.
+    """
+
+    def test_absolute_foreign_home_writes_require_approval(self):
+        # Paths deliberately outside Path.home() so the fold cannot rescue them.
+        host_home = str(Path.home())
+        assert not host_home.startswith("/home/deploy"), host_home
+        for command in (
+            "echo evil > /home/deploy/.ssh/authorized_keys",
+            "cat key >> /home/deploy/.ssh/authorized_keys",
+            "echo x | tee /home/deploy/.ssh/authorized_keys",
+            "cp /tmp/evil /home/deploy/.ssh/authorized_keys",
+            "mv /tmp/k /root/.ssh/id_rsa",
+            "sed -i 's/a/b/' /home/deploy/.ssh/authorized_keys",
+            "install -m600 /tmp/c /home/deploy/.netrc",
+            "echo pwned > /opt/svc/.bashrc",
+            "echo pwned > /opt/svc/.ssh/id_ed25519",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key is not None, command
+            assert desc is not None, command
+
+    def test_absolute_non_write_and_non_credential_stay_out(self):
+        for command in (
+            # Reads / copy-out stay safe (same contract as the tilde forms).
+            "cat /home/deploy/.ssh/id_rsa",
+            "cp /home/deploy/.ssh/config /tmp/x",
+            # Adjacent filename, not a credential leaf.
+            "echo x > /home/deploy/.sshbackup",
+            # Bare ``/.ssh/...`` (no home component) is not a user credential path.
+            "echo x > /.ssh/authorized_keys",
+            "echo x > /tmp/notes.txt",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is False, command
+            assert key is None
+            assert desc is None
+
+
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
 
